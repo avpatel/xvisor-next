@@ -65,7 +65,6 @@ typedef u32 timer_id_t;
 						       | (_timer & HPET_TIMER_MASK)))
 
 #define DEFAULT_HPET_SYS_TIMER		MK_TIMER_ID(0, 0, 0) /* system timer (chip 0, block 0, timer 0) */
-#define DEFAULT_SYS_TIMER_IRQ_NUM	32
 
 /************************************************************************
  * The system can have multiple HPET chips. Each chip can have upto 8
@@ -97,6 +96,7 @@ struct hpet_block {
 
 struct hpet_timer {
 	u32 timer_id;
+	u32 armed;
 	u64 conf_cap;
 	u32 is_busy;			/* If under use */
 	u64 hpet_period;		/* femto sec */
