@@ -35,10 +35,9 @@
 #include <cpu_apic.h>
 #include <hpet.h>
 
-#undef __DEBUG
-//#define __DEBUG
+#undef DEBUG
 
-#if defined(__DEBUG)
+#if defined(DEBUG)
 #define debug_print(fmt, args...) vmm_printf(fmt, ##args);
 #else
 #define debug_print(fmt, args...) { }
@@ -340,6 +339,11 @@ int __cpuinit hpet_clockchip_init(struct hpet_timer *timer, const char *chip_nam
 {
 	int rc;
 	u32 int_dest;
+	struct hpet_timer *timer = get_timer_from_id(timer_id);
+
+	if (unlikely(timer == NULL)) {
+		return VMM_ENODEV;
+	}
 
 	/* first disable the free running counter */
 	hpet_disable_main_counter(timer);
@@ -441,13 +445,19 @@ static void hpet_clocksource_disable(struct vmm_clocksource *cs)
 	hpet_disable_main_counter(timer);
 }
 
-static int __init hpet_clocksource_init(struct hpet_timer *timer)
+int __init hpet_clocksource_init(timer_id_t timer_id,
+				 const char *chip_name)
 {
 	u64 t1, t2;
+	struct hpet_timer *timer = get_timer_from_id(DEFAULT_HPET_SYS_TIMER);
+
+	if (unlikely(timer == NULL)) {
+		return VMM_ENODEV;
+	}
 
 	debug_print("Initializing HPET main counter.\n");
 
-	timer->clksrc.name = "hpet_clksrc";
+	timer->clksrc.name = chip_name;
 	timer->clksrc.rating = 300;
 	timer->clksrc.mask = 0xFFFFFFFFULL;
 	vmm_clocks_calc_mult_shift(&timer->clksrc.mult, &timer->clksrc.shift, timer->hpet_freq, NSEC_PER_SEC, 5);
@@ -477,14 +487,5 @@ static int __init hpet_clocksource_init(struct hpet_timer *timer)
 		vmm_panic("No.\n");
 	}
 	return vmm_clocksource_register(&timer->clksrc);
-}
-
-int __init arch_clocksource_init(void)
-{
-	struct hpet_timer *timer = get_timer_from_id(DEFAULT_HPET_SYS_TIMER);
-
-	if (unlikely(timer == NULL)) return VMM_ENODEV;
-
-	return hpet_clocksource_init(timer);
 }
 
