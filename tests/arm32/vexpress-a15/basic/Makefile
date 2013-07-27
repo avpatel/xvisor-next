@@ -18,7 +18,7 @@
 #
 # @file Makefile
 # @author Sukanto Ghosh (sukantoghosh@gmail.com)
-# @brief toplevel makefile to build ARM test code
+# @brief toplevel makefile to build firmware
 # */
 
 # Determine the build directory
@@ -35,13 +35,13 @@ common_dir=$(top_dir)/tests/arm32/common/basic
 board_arch       = v7
 board_text_start = 0x80800000
 board_objs       = $(obj_dir)/arm_board.o \
-                   $(obj_dir)/arm_timer.o \
                    $(obj_dir)/pic/gic.o \
+                   $(obj_dir)/timer/sp804.o \
                    $(obj_dir)/serial/pl01x.o
 board_fdt_support = y
 board_secure_extn = y
 board_smp	  = y
 
-# Include common makefile for basic test
+# Include common makefile for basic firmware
 include $(common_dir)/Makefile.inc
 

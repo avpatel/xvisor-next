@@ -57,43 +57,74 @@ static void vmm_scheduler_next(struct vmm_scheduler_ctrl *schedp,
 			       struct vmm_timer_event *ev, 
 			       arch_regs_t *regs)
 {
+	irq_flags_t cf, nf;
 	struct vmm_vcpu *current = schedp->current_vcpu;
 	struct vmm_vcpu *next = NULL; 
 
-	if (current) {
-		/* Normal scheduling */
-		if (current->state & VMM_VCPU_STATE_SAVEABLE) {
-			if (current->state == VMM_VCPU_STATE_RUNNING) {
-				current->state = VMM_VCPU_STATE_READY;
-				vmm_schedalgo_rq_enqueue(schedp->rq, current);
-			}
-			next = vmm_schedalgo_rq_dequeue(schedp->rq);
-			if (next && (next->id != current->id)) {
-				arch_vcpu_switch(current, next, regs);
-			}
-		} else {
-			if (current->state == VMM_VCPU_STATE_READY) {
-				vmm_schedalgo_rq_enqueue(schedp->rq, current);
-			}
-			next = vmm_schedalgo_rq_dequeue(schedp->rq);
-			if (next) {
-				arch_vcpu_switch(NULL, next, regs);
-			}
-		}
-	} else {
-		/* First time scheduling */
+	if (!current) {	/* First time scheduling */
 		next = vmm_schedalgo_rq_dequeue(schedp->rq);
-		if (next) {
-			arch_vcpu_switch(NULL, next, regs);
-		} else {
+		if (!next) {
 			/* This should never happen !!! */
 			vmm_panic("%s: no vcpu to switch to.\n", __func__);
 		}
+
+		vmm_spin_lock_irqsave_lite(&next->sched_lock, nf);
+		next->state = VMM_VCPU_STATE_RUNNING;
+		vmm_spin_unlock_irqrestore_lite(&next->sched_lock, nf);
+
+		arch_vcpu_switch(NULL, next, regs);
+		schedp->current_vcpu = next;
+		vmm_timer_event_start(ev, next->time_slice);
+
+		return;
 	}
 
-	/* Make next VCPU as current VCPU */
-	if (next) {
+	/* Normal scheduling */
+	vmm_spin_lock_irqsave_lite(&current->sched_lock, cf);
+
+	if (current->state & VMM_VCPU_STATE_SAVEABLE) {
+		if (current->state == VMM_VCPU_STATE_RUNNING) {
+			current->state = VMM_VCPU_STATE_READY;
+			vmm_schedalgo_rq_enqueue(schedp->rq, current);
+		}
+
+		vmm_spin_unlock_irqrestore_lite(&current->sched_lock, cf);
+
+		next = vmm_schedalgo_rq_dequeue(schedp->rq);
+		if (!next) {
+			/* This should never happen !!! */
+			vmm_panic("%s: no vcpu to switch to.\n", 
+				  __func__);
+		}
+
+		vmm_spin_lock_irqsave_lite(&next->sched_lock, nf);
 		next->state = VMM_VCPU_STATE_RUNNING;
+		vmm_spin_unlock_irqrestore_lite(&next->sched_lock, nf);
+
+		if (next != current) {
+			arch_vcpu_switch(current, next, regs);
+		}
+		schedp->current_vcpu = next;
+		vmm_timer_event_start(ev, next->time_slice);
+	} else {
+		if (current->state == VMM_VCPU_STATE_READY) {
+			vmm_schedalgo_rq_enqueue(schedp->rq, current);
+		}
+
+		vmm_spin_unlock_irqrestore_lite(&current->sched_lock, cf);
+
+		next = vmm_schedalgo_rq_dequeue(schedp->rq);
+		if (!next) {
+			/* This should never happen !!! */
+			vmm_panic("%s: no vcpu to switch to.\n", 
+				  __func__);
+		}
+
+		vmm_spin_lock_irqsave_lite(&next->sched_lock, nf);
+		next->state = VMM_VCPU_STATE_RUNNING;
+		vmm_spin_unlock_irqrestore_lite(&next->sched_lock, nf);
+
+		arch_vcpu_switch(NULL, next, regs);
 		schedp->current_vcpu = next;
 		vmm_timer_event_start(ev, next->time_slice);
 	}
@@ -183,9 +214,7 @@ int vmm_scheduler_state_change(struct vmm_vcpu *vcpu, u32 new_state)
 		return VMM_EFAIL;
 	}
 
-	arch_cpu_irq_save(flags);
-
-	vmm_spin_lock(&vcpu->lock);
+	vmm_spin_lock_irqsave_lite(&vcpu->sched_lock, flags);
 
 	switch(new_state) {
 	case VMM_VCPU_STATE_UNKNOWN:
@@ -201,7 +230,9 @@ int vmm_scheduler_state_change(struct vmm_vcpu *vcpu, u32 new_state)
 			/* Make sure VCPU is not in a ready queue */
 			if((schedp->current_vcpu != vcpu) &&
 			   (vcpu->state == VMM_VCPU_STATE_READY)) {
-				rc = vmm_schedalgo_rq_detach(schedp->rq, vcpu);
+				if ((rc = vmm_schedalgo_rq_detach(schedp->rq, vcpu))) {
+					break;
+				}
 			}
 			vcpu->reset_count++;
 			if ((rc = arch_vcpu_init(vcpu))) {
@@ -251,7 +282,7 @@ int vmm_scheduler_state_change(struct vmm_vcpu *vcpu, u32 new_state)
 		vcpu->state = new_state;
 	}
 
-	vmm_spin_unlock(&vcpu->lock);
+	vmm_spin_unlock_irqrestore_lite(&vcpu->sched_lock, flags);
 
 	if (preempt && schedp->current_vcpu) {
 		if (schedp->current_vcpu->is_normal) {
@@ -264,8 +295,6 @@ int vmm_scheduler_state_change(struct vmm_vcpu *vcpu, u32 new_state)
 			}
 		}
 	}
-
-	arch_cpu_irq_restore(flags);
 
 	return rc;
 }
@@ -298,7 +327,7 @@ void vmm_scheduler_irq_exit(arch_regs_t *regs)
 	/* If current vcpu is not RUNNING or yield on exit is set
 	 * then context switch
 	 */
-	if ((vcpu->state != VMM_VCPU_STATE_RUNNING) ||
+	if ((vmm_manager_vcpu_state(vcpu) != VMM_VCPU_STATE_RUNNING) ||
 	    schedp->yield_on_irq_exit) {
 		vmm_scheduler_next(schedp, &schedp->ev, schedp->irq_regs);
 		schedp->yield_on_irq_exit = FALSE;
@@ -385,7 +414,8 @@ void vmm_scheduler_yield(void)
 		 * Just enable yield on exit and rest will be taken care
 		 * by vmm_scheduler_irq_exit()
 		 */
-		if (schedp->current_vcpu->state == VMM_VCPU_STATE_RUNNING) {
+		if (vmm_manager_vcpu_state(schedp->current_vcpu) == 
+						VMM_VCPU_STATE_RUNNING) {
 			schedp->yield_on_irq_exit = TRUE;
 		}
 	} else {
@@ -440,7 +470,7 @@ int __cpuinit vmm_scheduler_init(void)
 	INIT_TIMER_EVENT(&schedp->ev, &vmm_scheduler_timer_event, schedp);
 
 	/* Create idle orphan vcpu with default time slice. (Per Host CPU) */
-	vmm_sprintf(vcpu_name, "idle/%d", cpu);
+	vmm_snprintf(vcpu_name, sizeof(vcpu_name), "idle/%d", cpu);
 	schedp->idle_vcpu = vmm_manager_vcpu_orphan_create(vcpu_name,
 						(virtual_addr_t)&idle_orphan,
 						IDLE_VCPU_STACK_SZ,
@@ -448,6 +478,12 @@ int __cpuinit vmm_scheduler_init(void)
 						IDLE_VCPU_TIMESLICE);
 	if (!schedp->idle_vcpu) {
 		return VMM_EFAIL;
+	}
+
+	/* The idle vcpu need to stay on this cpu */
+	if ((rc = vmm_manager_vcpu_set_affinity(schedp->idle_vcpu,
+						vmm_cpumask_of(cpu)))) {
+		return rc;
 	}
 
 	/* Kick idle orphan vcpu */
