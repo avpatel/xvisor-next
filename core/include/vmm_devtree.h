@@ -64,6 +64,9 @@
 
 #define VMM_DEVTREE_GUESTINFO_NODE_NAME		"guests"
 #define VMM_DEVTREE_VCPUS_NODE_NAME		"vcpus"
+#define VMM_DEVTREE_ENDIANNESS_ATTR_NAME	"endianness"
+#define VMM_DEVTREE_ENDIANNESS_VAL_BIG		"big"
+#define VMM_DEVTREE_ENDIANNESS_VAL_LITTLE	"little"
 #define VMM_DEVTREE_START_PC_ATTR_NAME		"start_pc"
 #define VMM_DEVTREE_PRIORITY_ATTR_NAME		"priority"
 #define VMM_DEVTREE_TIME_SLICE_ATTR_NAME	"time_slice"
@@ -82,6 +85,7 @@
 #define VMM_DEVTREE_PHYS_SIZE_ATTR_NAME		"physical_size"
 #define VMM_DEVTREE_SWITCH_ATTR_NAME		"switch"
 #define VMM_DEVTREE_BLKDEV_ATTR_NAME		"blkdev"
+#define VMM_DEVTREE_CPU_AFFINITY_ATTR_NAME	"cpu_affinity"
 
 enum vmm_devtree_attrypes {
 	VMM_DEVTREE_ATTRTYPE_UNKNOWN = 0,

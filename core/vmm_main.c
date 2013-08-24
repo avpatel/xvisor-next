@@ -36,6 +36,7 @@
 #include <vmm_delay.h>
 #include <vmm_manager.h>
 #include <vmm_scheduler.h>
+#include <vmm_loadbal.h>
 #include <vmm_threads.h>
 #include <vmm_profiler.h>
 #include <vmm_devdrv.h>
@@ -278,15 +279,6 @@ void vmm_init(void)
 		vmm_hang();
 	}
 
-#if defined(CONFIG_SMP)
-	/* Initialize inter-processor interrupts */
-	vmm_printf("Initialize SMP IPIs\n")
-	ret = vmm_smp_ipi_init();
-	if (ret) {
-		vmm_hang();
-	}
-#endif
-
 	/* Initialize CPU early */
 	vmm_printf("Initialize CPU Early\n");
 	ret = arch_cpu_early_init();
@@ -350,7 +342,30 @@ void vmm_init(void)
 		vmm_panic("Error %d\n", ret);
 	}
 
+	/* Initialize hypervisor threads */
+	vmm_printf("Initialize Hypervisor Threads\n");
+	ret = vmm_threads_init();
+	if (ret) {
+		vmm_panic("Error %d\n", ret);
+	}
+
+#ifdef CONFIG_PROFILE
+	/* Intialize hypervisor profiler */
+	vmm_printf("Initialize Hypervisor Profiler\n");
+	ret = vmm_profiler_init();
+	if (ret) {
+		vmm_panic("Error %d\n", ret);
+	}
+#endif
+
 #if defined(CONFIG_SMP)
+	/* Initialize inter-processor interrupts */
+	vmm_printf("Initialize Inter Processor Interrupts\n")
+	ret = vmm_smp_ipi_init();
+	if (ret) {
+		vmm_hang();
+	}
+
 	/* Initialize secondary CPUs */
 	vmm_printf("Initialize Secondary CPUs\n");
 	ret = arch_smp_init_cpus();
@@ -374,19 +389,10 @@ void vmm_init(void)
 			vmm_printf("Failed to start CPU%d\n", ret);
 		}
 	}
-#endif
 
-	/* Initialize hypervisor threads */
-	vmm_printf("Initialize Hypervisor Threads\n");
-	ret = vmm_threads_init();
-	if (ret) {
-		vmm_panic("Error %d\n", ret);
-	}
-
-#ifdef CONFIG_PROFILE
-	/* Intialize hypervisor profiler */
-	vmm_printf("Initialize Hypervisor Profiler\n");
-	ret = vmm_profiler_init();
+	/* Initialize hypervisor load balancer */
+	vmm_printf("Initialize Hypervisor Load Balancer\n");
+	ret = vmm_loadbal_init();
 	if (ret) {
 		vmm_panic("Error %d\n", ret);
 	}
@@ -434,12 +440,6 @@ void vmm_init_secondary(void)
 		vmm_hang();
 	}
 
-	/* Initialize inter-processor interrupts */
-	ret = vmm_smp_ipi_init();
-	if (ret) {
-		vmm_hang();
-	}
-
 	/* Initialize clockchip manager */
 	ret = vmm_clockchip_init();
 	if (ret) {
@@ -460,6 +460,12 @@ void vmm_init_secondary(void)
 
 	/* Initialize hypervisor scheduler */
 	ret = vmm_scheduler_init();
+	if (ret) {
+		vmm_hang();
+	}
+
+	/* Initialize inter-processor interrupts */
+	ret = vmm_smp_ipi_init();
 	if (ret) {
 		vmm_hang();
 	}

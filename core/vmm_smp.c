@@ -22,15 +22,38 @@
  */
 
 #include <vmm_error.h>
+#include <vmm_percpu.h>
 #include <vmm_smp.h>
+#include <vmm_delay.h>
 #include <vmm_stdio.h>
 #include <vmm_timer.h>
-#include <libs/list.h>
-#include <arch_locks.h>
+#include <vmm_completion.h>
+#include <vmm_manager.h>
+#include <libs/fifo.h>
 
-#define MAX_SMP_IPI_PER_CPU		(CONFIG_CPU_COUNT)
+/* Theoretically, number of host CPUs making Sync IPI 
+ * simultaneously to a host CPU should not be more than 
+ * maximum possible hardware CPUs but, we keep minimum
+ * Sync IPIs per host CPU to max possible VCPUs.
+ */
+#define SMP_IPI_MAX_SYNC_PER_CPU	(CONFIG_MAX_VCPU_COUNT)
+
+/* Various trials show that having minimum of 64 Async IPI
+ * per host CPU is good enough. If we require to increase 
+ * this limit then we should have a config option.
+ */
+#define SMP_IPI_MAX_ASYNC_PER_CPU	(64)
+
+#define SMP_IPI_WAIT_TRY_COUNT		100
+#define SMP_IPI_WAIT_UDELAY		1000
+
+#define IPI_VCPU_STACK_SZ 		CONFIG_THREAD_STACK_SIZE
+#define IPI_VCPU_PRIORITY 		VMM_VCPU_MAX_PRIORITY
+#define IPI_VCPU_TIMESLICE 		VMM_VCPU_DEF_TIME_SLICE
 
 struct smp_ipi_call {
+	u32 src_cpu;
+	u32 dst_cpu;
 	void (*func)(void *, void *, void *);
 	void *arg0;
 	void *arg1;
@@ -38,99 +61,86 @@ struct smp_ipi_call {
 };
 
 struct smp_ipi_ctrl {
-	arch_spinlock_t lock;
-	u32 head;
-	u32 tail;
-	u32 avail;
-	struct smp_ipi_call queue[MAX_SMP_IPI_PER_CPU];
-} __cacheline_aligned_in_smp;
+	struct fifo *sync_fifo;
+	struct fifo *async_fifo;
+	struct vmm_completion ipi_avail;
+	struct vmm_vcpu *ipi_vcpu;
+};
 
-static struct smp_ipi_ctrl smp_ipi[CONFIG_CPU_COUNT];
+static DEFINE_PER_CPU(struct smp_ipi_ctrl, ictl);
 
-static void smp_ipi_submit(u32 cpu, struct smp_ipi_call *ipic)
+static void smp_ipi_sync_submit(struct smp_ipi_ctrl *ictlp, 
+				struct smp_ipi_call *ipic)
 {
-	struct smp_ipi_call *ipic_p;
-	struct smp_ipi_ctrl *ctrl;
+	int try;
 
-	if ((cpu >= CONFIG_CPU_COUNT) || !ipic) {
+	if (!ipic || !ipic->func) {
 		return;
 	}
 
-	ctrl = &smp_ipi[cpu];
-
-	arch_spin_lock(&ctrl->lock);
-
-	if (ctrl->avail >= MAX_SMP_IPI_PER_CPU) {
-		WARN(1, "CPU%d: IPI queue full\n", cpu);
-		arch_spin_unlock(&ctrl->lock);
-		return;
+	try = SMP_IPI_WAIT_TRY_COUNT;
+	while (!fifo_enqueue(ictlp->sync_fifo, ipic, FALSE) && try) {
+		vmm_udelay(SMP_IPI_WAIT_UDELAY);
+		try--;
 	}
 
-	ipic_p = &ctrl->queue[ctrl->head];
-	ipic_p->func = ipic->func;
-	ipic_p->arg0 = ipic->arg0;
-	ipic_p->arg1 = ipic->arg1;
-	ipic_p->arg2 = ipic->arg2;
-
-	ctrl->head++;
-	if (ctrl->head >= MAX_SMP_IPI_PER_CPU) {
-		ctrl->head = 0;
+	if (!try) {
+		WARN(1, "CPU%d: IPI sync fifo full\n", ipic->dst_cpu);
 	}
-
-	ctrl->avail++;
-
-	arch_spin_unlock(&ctrl->lock);
 }
 
-static u32 smp_ipi_pending_count(u32 cpu)
+static void smp_ipi_async_submit(struct smp_ipi_ctrl *ictlp, 
+				 struct smp_ipi_call *ipic)
 {
-	u32 ret;
-	struct smp_ipi_ctrl *ctrl;
+	int try;
 
-	if (cpu >= CONFIG_CPU_COUNT) {
-		return 0;
+	if (!ipic || !ipic->func) {
+		return;
 	}
 
-	ctrl = &smp_ipi[cpu];
+	try = SMP_IPI_WAIT_TRY_COUNT;
+	while (!fifo_enqueue(ictlp->async_fifo, ipic, FALSE) && try) {
+		vmm_udelay(SMP_IPI_WAIT_UDELAY);
+		try--;
+	}
 
-	arch_spin_lock(&ctrl->lock);
-	ret = ctrl->avail;
-	arch_spin_unlock(&ctrl->lock);
+	if (!try) {
+		WARN(1, "CPU%d: IPI async fifo full\n", ipic->dst_cpu);
+	}
+}
 
-	return ret;
+static void smp_ipi_main(void)
+{
+	struct smp_ipi_call ipic;
+	struct smp_ipi_ctrl *ictlp = &this_cpu(ictl);
+
+	while (1) {
+		/* Wait for some IPI to be available */
+		vmm_completion_wait(&ictlp->ipi_avail);
+
+		/* Process async IPIs */
+		while (fifo_dequeue(ictlp->async_fifo, &ipic)) {
+			if (ipic.func) {
+				ipic.func(ipic.arg0, ipic.arg1, ipic.arg2);
+			}
+		}
+	}
 }
 
 void vmm_smp_ipi_exec(void)
 {
-	u32 cpu = vmm_smp_processor_id();
-	struct smp_ipi_call *ipic;
-	struct smp_ipi_ctrl *ctrl;
+	struct smp_ipi_call ipic;
+	struct smp_ipi_ctrl *ictlp = &this_cpu(ictl);
 
-	if (cpu >= CONFIG_CPU_COUNT) {
-		return;
+	/* Process Sync IPIs */
+	while (fifo_dequeue(ictlp->sync_fifo, &ipic)) {
+		if (ipic.func) {
+			ipic.func(ipic.arg0, ipic.arg1, ipic.arg2);
+		}
 	}
 
-	ctrl = &smp_ipi[cpu];
-
-	arch_spin_lock(&ctrl->lock);
-
-	while (ctrl->avail) {
-		ipic = &ctrl->queue[ctrl->tail];
-
-		if (ipic->func) {
-			ipic->func(ipic->arg0, ipic->arg1, ipic->arg2);
-		}
-		ipic->func = NULL;
-
-		ctrl->tail++;
-		if (ctrl->tail >= MAX_SMP_IPI_PER_CPU) {
-			ctrl->tail = 0;
-		}
-
-		ctrl->avail--;
-	}
-
-	arch_spin_unlock(&ctrl->lock);
+	/* Signal IPI available event */
+	vmm_completion_complete(&ictlp->ipi_avail);
 }
 
 void vmm_smp_ipi_async_call(const struct vmm_cpumask *dest,
@@ -154,11 +164,13 @@ void vmm_smp_ipi_async_call(const struct vmm_cpumask *dest,
 				continue;
 			}
 
+			ipic.src_cpu = cpu;
+			ipic.dst_cpu = c;
 			ipic.func = func;
 			ipic.arg0 = arg0;
 			ipic.arg1 = arg1;
 			ipic.arg2 = arg2;
-			smp_ipi_submit(c, &ipic);
+			smp_ipi_async_submit(&per_cpu(ictl, c), &ipic);
 			vmm_cpumask_set_cpu(c, &trig_mask);
 			trig_count++;
 		}
@@ -174,10 +186,12 @@ int vmm_smp_ipi_sync_call(const struct vmm_cpumask *dest,
 			   void (*func)(void *, void *, void *),
 			   void *arg0, void *arg1, void *arg2)
 {
+	int rc = VMM_OK;
 	u64 timeout_tstamp;
-	u32 c, check_count, trig_count, cpu = vmm_smp_processor_id();
+	u32 c, trig_count, cpu = vmm_smp_processor_id();
 	struct vmm_cpumask trig_mask = VMM_CPU_MASK_NONE;
 	struct smp_ipi_call ipic;
+	struct smp_ipi_ctrl *ictlp;
 
 	if (!dest || !func) {
 		return VMM_EFAIL;
@@ -192,11 +206,13 @@ int vmm_smp_ipi_sync_call(const struct vmm_cpumask *dest,
 				continue;
 			}
 
+			ipic.src_cpu = cpu;
+			ipic.dst_cpu = c;
 			ipic.func = func;
 			ipic.arg0 = arg0;
 			ipic.arg1 = arg1;
 			ipic.arg2 = arg2;
-			smp_ipi_submit(c, &ipic);
+			smp_ipi_sync_submit(&per_cpu(ictl, c), &ipic);
 			vmm_cpumask_set_cpu(c, &trig_mask);
 			trig_count++;
 		}
@@ -205,52 +221,95 @@ int vmm_smp_ipi_sync_call(const struct vmm_cpumask *dest,
 	if (trig_count) {
 		arch_smp_ipi_trigger(&trig_mask);
 
+		rc = VMM_ETIMEDOUT;
 		timeout_tstamp = vmm_timer_timestamp();
 		timeout_tstamp += (u64)timeout_msecs * 1000000ULL;
 		while (vmm_timer_timestamp() < timeout_tstamp) {
-			check_count = 0;
 			for_each_cpu(c, &trig_mask) {
-				if (!smp_ipi_pending_count(c)) {
-					check_count++;
+				ictlp = &per_cpu(ictl, c);
+				if (!fifo_avail(ictlp->sync_fifo)) {
+					vmm_cpumask_clear_cpu(c, &trig_mask);
+					trig_count--;
 				}
 			}
 
-			if (check_count == trig_count) {
-				return VMM_OK;
+			if (!trig_count) {
+				rc = VMM_OK;
+				break;
 			}
+
+			vmm_udelay(SMP_IPI_WAIT_UDELAY);
 		}
-		return VMM_ETIMEDOUT;
-	} else {
-		return VMM_OK;
 	}
+
+	return rc;
 }
 
 int __cpuinit vmm_smp_ipi_init(void)
 {
 	int rc;
-	u32 c, q, cpu = vmm_smp_processor_id();
+	char vcpu_name[VMM_FIELD_NAME_SIZE];
+	u32 cpu = vmm_smp_processor_id();
+	struct smp_ipi_ctrl *ictlp = &this_cpu(ictl);
 
-	/* Initialize IPI list */
-	if (!cpu) {
-		for (c = 0; c < CONFIG_CPU_COUNT; c++) {
-			ARCH_SPIN_LOCK_INIT(&smp_ipi[c].lock);
-			smp_ipi[c].head = 0;
-			smp_ipi[c].tail = 0;
-			smp_ipi[c].avail = 0;
-			for (q = 0; q < MAX_SMP_IPI_PER_CPU; q++) {
-				smp_ipi[c].queue[q].func = NULL;
-				smp_ipi[c].queue[q].arg0 = NULL;
-				smp_ipi[c].queue[q].arg1 = NULL;
-				smp_ipi[c].queue[q].arg2 = NULL;
-			}
-		}
+	/* Initialize Sync IPI FIFO */
+	ictlp->sync_fifo = fifo_alloc(sizeof(struct smp_ipi_call), 
+					   SMP_IPI_MAX_SYNC_PER_CPU);
+	if (!ictlp->sync_fifo) {
+		rc = VMM_ENOMEM;
+		goto fail;
+	}
+
+	/* Initialize Async IPI FIFO */
+	ictlp->async_fifo = fifo_alloc(sizeof(struct smp_ipi_call), 
+					   SMP_IPI_MAX_ASYNC_PER_CPU);
+	if (!ictlp->async_fifo) {
+		rc = VMM_ENOMEM;
+		goto fail_free_sync;
+	}
+
+	/* Initialize IPI available completion event */
+	INIT_COMPLETION(&ictlp->ipi_avail);
+
+	/* Create IPI bottom-half VCPU. (Per Host CPU) */
+	vmm_snprintf(vcpu_name, sizeof(vcpu_name), "ipi/%d", cpu);
+	ictlp->ipi_vcpu = vmm_manager_vcpu_orphan_create(vcpu_name,
+						(virtual_addr_t)&smp_ipi_main,
+						IPI_VCPU_STACK_SZ,
+						IPI_VCPU_PRIORITY, 
+						IPI_VCPU_TIMESLICE);
+	if (!ictlp->ipi_vcpu) {
+		rc = VMM_EFAIL;
+		goto fail_free_async;
+	}
+
+	/* The IPI orphan VCPU need to stay on this cpu */
+	if ((rc = vmm_manager_vcpu_set_affinity(ictlp->ipi_vcpu,
+						vmm_cpumask_of(cpu)))) {
+		goto fail_free_vcpu;
+	}
+
+	/* Kick IPI orphan VCPU */
+	if ((rc = vmm_manager_vcpu_kick(ictlp->ipi_vcpu))) {
+		goto fail_free_vcpu;
 	}
 
 	/* Arch specific IPI initialization */
 	if ((rc = arch_smp_ipi_init())) {
-		return rc;
+		goto fail_stop_vcpu;
 	}
 
 	return VMM_OK;
+
+fail_stop_vcpu:
+	vmm_manager_vcpu_halt(ictlp->ipi_vcpu);
+fail_free_vcpu:
+	vmm_manager_vcpu_orphan_destroy(ictlp->ipi_vcpu);
+fail_free_async:
+	fifo_free(ictlp->async_fifo);
+fail_free_sync:
+	fifo_free(ictlp->sync_fifo);
+fail:
+	return rc;
 }
 

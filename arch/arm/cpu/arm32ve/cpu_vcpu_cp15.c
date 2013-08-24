@@ -303,6 +303,8 @@ bool cpu_vcpu_cp15_write(struct vmm_vcpu *vcpu,
 	case 1: /* System configuration.  */
 		switch (opc2) {
 		case 1: /* Auxiliary control register.  */
+			if (!arm_feature(vcpu, ARM_FEATURE_AUXCR))
+				goto bad_reg;
 			/* Not implemented.  */
 			break;
 		default:
@@ -474,8 +476,8 @@ bad_reg:
 	return FALSE;
 }
 
-void cpu_vcpu_cp15_switch_context(struct vmm_vcpu * tvcpu, 
-				  struct vmm_vcpu * vcpu)
+void cpu_vcpu_cp15_switch_context(struct vmm_vcpu *tvcpu, 
+				  struct vmm_vcpu *vcpu)
 {
 	arm_priv_cp15_t *cp15;
 	if (tvcpu && tvcpu->is_normal) {
