@@ -438,6 +438,139 @@ int cpu_vcpu_spsr_update(struct vmm_vcpu *vcpu,
 	return VMM_OK;
 }
 
+int cpu_vcpu_inject_undef(struct vmm_vcpu *vcpu,
+			  arch_regs_t *regs)
+{
+	u32 old_cpsr, new_cpsr, sctlr;
+
+	/* Sanity checks */
+	if (!vcpu || !regs) {
+		return VMM_EFAIL;
+	}
+	if (vcpu != vmm_scheduler_current_vcpu()) {
+		/* This function should only be called for current VCPU */
+		vmm_panic("%d not called for current vcpu\n", __func__);
+	}
+
+	/* Retrive current SCTLR */
+	sctlr = read_sctlr();
+
+	/* Compute CPSR changes */
+	old_cpsr = new_cpsr = regs->cpsr;
+	new_cpsr &= ~CPSR_MODE_MASK;
+	new_cpsr |= (CPSR_MODE_UNDEFINED | CPSR_IRQ_DISABLED);
+	new_cpsr &= ~(CPSR_IT2_MASK | 
+			CPSR_IT1_MASK | 
+			CPSR_JAZZLE_ENABLED | 
+			CPSR_BE_ENABLED | 
+			CPSR_THUMB_ENABLED);
+	if (sctlr & SCTLR_TE_MASK) {
+		new_cpsr |= CPSR_THUMB_ENABLED;
+	}
+	if (sctlr & SCTLR_EE_MASK) {
+		new_cpsr |= CPSR_BE_ENABLED;
+	}
+
+	/* Update CPSR, SPSR, LR and PC */
+	cpu_vcpu_spsr_update(vcpu, CPSR_MODE_UNDEFINED, old_cpsr);
+	cpu_vcpu_regmode_write(vcpu, regs, CPSR_MODE_UNDEFINED, 14, 
+		regs->pc - ((old_cpsr & CPSR_THUMB_ENABLED) ? 2 : 4));
+	if (sctlr & SCTLR_V_MASK) {
+		regs->pc = CPU_IRQ_HIGHVEC_BASE;
+	} else {
+		regs->pc = read_vbar();
+	}
+	regs->pc += 4;
+	regs->cpsr = new_cpsr;
+
+	return VMM_OK;
+}
+
+static int __cpu_vcpu_inject_abt(struct vmm_vcpu *vcpu,
+				 arch_regs_t *regs,
+				 bool is_pabt,
+				 virtual_addr_t addr)
+{
+	u32 old_cpsr, new_cpsr, sctlr, ttbcr;
+
+	/* Sanity checks */
+	if (!vcpu || !regs) {
+		return VMM_EFAIL;
+	}
+	if (vcpu != vmm_scheduler_current_vcpu()) {
+		/* This function should only be called for current VCPU */
+		vmm_panic("%d not called for current vcpu\n", __func__);
+	}
+
+	/* Retrive current SCTLR */
+	sctlr = read_sctlr();
+
+	/* Compute CPSR changes */
+	old_cpsr = new_cpsr = regs->cpsr;
+	new_cpsr &= ~CPSR_MODE_MASK;
+	new_cpsr |= (CPSR_MODE_ABORT | 
+			CPSR_ASYNC_ABORT_DISABLED | 
+			CPSR_IRQ_DISABLED);
+	new_cpsr &= ~(CPSR_IT2_MASK | 
+			CPSR_IT1_MASK | 
+			CPSR_JAZZLE_ENABLED | 
+			CPSR_BE_ENABLED | 
+			CPSR_THUMB_ENABLED);
+	if (sctlr & SCTLR_TE_MASK) {
+		new_cpsr |= CPSR_THUMB_ENABLED;
+	}
+	if (sctlr & SCTLR_EE_MASK) {
+		new_cpsr |= CPSR_BE_ENABLED;
+	}
+
+	/* Update CPSR, SPSR, LR and PC */
+	cpu_vcpu_spsr_update(vcpu, CPSR_MODE_ABORT, old_cpsr);
+	cpu_vcpu_regmode_write(vcpu, regs, CPSR_MODE_ABORT, 14, 
+		regs->pc - ((old_cpsr & CPSR_THUMB_ENABLED) ? 4 : 0));
+	if (sctlr & SCTLR_V_MASK) {
+		regs->pc = CPU_IRQ_HIGHVEC_BASE;
+	} else {
+		regs->pc = read_vbar();
+	}
+	regs->pc += (is_pabt) ? 12 : 16;
+	regs->cpsr = new_cpsr;
+
+	/* Update abort registers */
+	ttbcr = read_ttbcr();
+	if (is_pabt) {
+		/* Set IFAR and IFSR */
+		write_ifar(addr);
+		if (ttbcr >> 31) { /* LPAE MMU */
+			write_ifsr((1 << 9) | 0x22);
+		} else { /* Legacy ARMv6 MMU */
+			write_ifsr(0x2);
+		}
+	} else {
+		/* Set DFAR and DFSR */
+		write_dfar(addr);
+		if (ttbcr >> 31) { /* LPAE MMU */
+			write_dfsr((1 << 9) | 0x22);
+		} else { /* Legacy ARMv6 MMU */
+			write_dfsr(0x2);
+		}
+	}
+
+	return VMM_OK;
+}
+
+int cpu_vcpu_inject_pabt(struct vmm_vcpu *vcpu,
+			 arch_regs_t *regs)
+{
+	return __cpu_vcpu_inject_abt(vcpu, regs, TRUE, regs->pc);
+}
+
+int cpu_vcpu_inject_dabt(struct vmm_vcpu *vcpu,
+			 arch_regs_t *regs,
+			 virtual_addr_t addr)
+{
+	return __cpu_vcpu_inject_abt(vcpu, regs, FALSE, addr);
+}
+
 int arch_guest_init(struct vmm_guest *guest)
 {
 	if (!guest->reset_count) {
@@ -477,6 +610,7 @@ int arch_vcpu_init(struct vmm_vcpu *vcpu)
 	u32 ite, cpuid = 0;
 	arm_priv_t *p;
 	const char *attr;
+	irq_flags_t flags;
 	/* Initialize User Mode Registers */
 	/* For both Orphan & Normal VCPUs */
 	memset(arm_regs(vcpu), 0, sizeof(arch_regs_t));
@@ -542,8 +676,9 @@ int arch_vcpu_init(struct vmm_vcpu *vcpu)
 		p->spsr_fiq = 0x0;
 	}
 	p->last_hcpu = 0xFFFFFFFF;
-	if (!vcpu->reset_count) {
+	if (vcpu->reset_count == 0) {
 		/* Initialize Hypervisor Configuration */
+		INIT_SPIN_LOCK(&p->hcr_lock);
 		p->hcr = (HCR_TAC_MASK |
 				HCR_TSW_MASK |
 				HCR_TIDCP_MASK |
@@ -642,7 +777,9 @@ int arch_vcpu_init(struct vmm_vcpu *vcpu)
 		}
 	} else {
 		/* Clear virtual exception bits in HCR */
+		vmm_spin_lock_irqsave(&p->hcr_lock, flags);
 		p->hcr &= ~(HCR_VA_MASK | HCR_VI_MASK | HCR_VF_MASK);
+		vmm_spin_unlock_irqrestore(&p->hcr_lock, flags);
 	}
 	/* Intialize Generic timer */
 	if (arm_feature(vcpu, ARM_FEATURE_GENERIC_TIMER)) {
@@ -783,6 +920,7 @@ void arch_vcpu_switch(struct vmm_vcpu *tvcpu,
 		      arch_regs_t *regs)
 {
 	u32 ite;
+	irq_flags_t flags;
 	
 	if (tvcpu) {
 		/* Save general purpose registers */
@@ -819,7 +957,7 @@ void arch_vcpu_switch(struct vmm_vcpu *tvcpu,
 	}
 	regs->cpsr = arm_regs(vcpu)->cpsr;
 	if (vcpu->is_normal) {
-		if (arm_priv(tvcpu)->last_hcpu != vmm_smp_processor_id()) {
+		if (arm_priv(vcpu)->last_hcpu != vmm_smp_processor_id()) {
 			/* Invalidate all guest TLB enteries because
 			 * we might have stale guest TLB enteries from
 			 * our previous run on new_hcpu host CPU 
@@ -834,7 +972,9 @@ void arch_vcpu_switch(struct vmm_vcpu *tvcpu,
 			isb();
 		}
 		/* Restore hypervisor config */
+		vmm_spin_lock_irqsave(&arm_priv(vcpu)->hcr_lock, flags);
 		write_hcr(arm_priv(vcpu)->hcr);
+		vmm_spin_unlock_irqrestore(&arm_priv(vcpu)->hcr_lock, flags);
 		write_hcptr(arm_priv(vcpu)->hcptr);
 		write_hstr(arm_priv(vcpu)->hstr);
 		/* Restore general purpose banked registers */
