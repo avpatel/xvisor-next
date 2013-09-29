@@ -129,6 +129,7 @@ int vmm_manager_vcpu_stats(struct vmm_vcpu *vcpu,
 {
 	irq_flags_t flags;
 	u64 current_tstamp;
+	u32 current_state;
 
 	if (!vcpu) {
 		return VMM_EFAIL;
@@ -140,9 +141,11 @@ int vmm_manager_vcpu_stats(struct vmm_vcpu *vcpu,
 	/* Acquire scheduling lock */
 	vmm_write_lock_irqsave_lite(&vcpu->sched_lock, flags);
 
+	current_state = arch_atomic_read(&vcpu->state);
+
 	/* Retrive current state and current hcpu */
 	if (state) {
-		*state = vcpu->state;
+		*state = current_state;
 	}
 	if (priority) {
 		*priority = vcpu->priority;
@@ -152,7 +155,7 @@ int vmm_manager_vcpu_stats(struct vmm_vcpu *vcpu,
 	}
 
 	/* Syncup statistics based on current timestamp */
-	switch (vcpu->state) {
+	switch (current_state) {
 	case VMM_VCPU_STATE_READY:
 		vcpu->state_ready_nsecs += 
 				current_tstamp - vcpu->state_tstamp;
@@ -205,18 +208,11 @@ int vmm_manager_vcpu_stats(struct vmm_vcpu *vcpu,
 
 u32 vmm_manager_vcpu_get_state(struct vmm_vcpu *vcpu)
 {
-	u32 state;
-	irq_flags_t flags;
-
 	if (!vcpu) {
 		return VMM_VCPU_STATE_UNKNOWN;
 	}
 
-	vmm_read_lock_irqsave_lite(&vcpu->sched_lock, flags);
-	state = vcpu->state;
-	vmm_read_unlock_irqrestore_lite(&vcpu->sched_lock, flags);
-
-	return state;
+	return (u32)arch_atomic_read(&vcpu->state);
 }
 
 int vmm_manager_vcpu_set_state(struct vmm_vcpu *vcpu, u32 new_state)
@@ -251,7 +247,7 @@ int vmm_manager_vcpu_get_hcpu(struct vmm_vcpu *vcpu, u32 *hcpu)
 {
 	irq_flags_t flags;
 
-	if (!vcpu && !hcpu) {
+	if ((vcpu == NULL) || (hcpu == NULL)) {
 		return VMM_EFAIL;
 	}
 
@@ -293,6 +289,7 @@ int vmm_manager_vcpu_set_hcpu(struct vmm_vcpu *vcpu, u32 hcpu)
 {
 	u32 old_hcpu;
 	irq_flags_t flags;
+	u32 state;
 
 	if (!vcpu) {
 		return VMM_EFAIL;
@@ -316,9 +313,11 @@ int vmm_manager_vcpu_set_hcpu(struct vmm_vcpu *vcpu, u32 hcpu)
 		return VMM_EINVALID;
 	}
 
+	state = arch_atomic_read(&vcpu->state);
+
 	/* Check if we don't need to migrate VCPU to new hcpu */
-	if ((vcpu->state != VMM_VCPU_STATE_READY) &&
-	    (vcpu->state != VMM_VCPU_STATE_RUNNING)) {
+	if ((state != VMM_VCPU_STATE_READY) &&
+	    (state != VMM_VCPU_STATE_RUNNING)) {
 		vcpu->hcpu = hcpu;
 		vmm_write_unlock_irqrestore_lite(&vcpu->sched_lock, flags);
 		return VMM_OK;
@@ -422,6 +421,7 @@ struct vmm_vcpu *vmm_manager_vcpu_orphan_create(const char *name,
 	}
 	vcpu->node = NULL;
 	vcpu->is_normal = FALSE;
+	vcpu->is_poweroff = FALSE;
 	vcpu->guest = NULL;
 
 	/* Setup start program counter and stack */
@@ -437,7 +437,7 @@ struct vmm_vcpu *vmm_manager_vcpu_orphan_create(const char *name,
 	INIT_RW_LOCK(&vcpu->sched_lock);
 	vcpu->hcpu = vmm_smp_processor_id();
 	vcpu->cpu_affinity = vmm_cpumask_of(vcpu->hcpu);
-	vcpu->state = VMM_VCPU_STATE_UNKNOWN;
+	arch_atomic_write(&vcpu->state, VMM_VCPU_STATE_UNKNOWN);
 	vcpu->state_tstamp = vmm_timer_timestamp();
 	vcpu->state_ready_nsecs = 0;
 	vcpu->state_running_nsecs = 0;
@@ -699,6 +699,12 @@ int vmm_manager_guest_reset(struct vmm_guest *guest)
 
 static int manager_guest_kick_iter(struct vmm_vcpu *vcpu, void *priv)
 {
+	/* Do not kick VCPU with poweroff flag set 
+	 * when Guest is kicked.
+	 */
+	if (vcpu->is_poweroff) {
+		return VMM_OK;
+	}
 	return vmm_manager_vcpu_kick(vcpu);
 }
 
@@ -751,8 +757,8 @@ struct vmm_guest *vmm_manager_guest_create(struct vmm_devtree_node *gnode)
 	struct dlist *lentry;
 	struct vmm_devtree_node *vsnode;
 	struct vmm_devtree_node *vnode;
-	struct vmm_guest *guest;
-	struct vmm_vcpu *vcpu;
+	struct vmm_guest *guest = NULL;
+	struct vmm_vcpu *vcpu = NULL;
 
 	/* Sanity checks */
 	if (!gnode) {
@@ -781,8 +787,6 @@ struct vmm_guest *vmm_manager_guest_create(struct vmm_devtree_node *gnode)
 			return NULL;
 		}
 	}
-
-	guest = NULL;
 
 	/* Find next available guest instance */
 	for (gnum = 0; gnum < CONFIG_MAX_GUEST_COUNT; gnum++) {
@@ -872,6 +876,7 @@ struct vmm_guest *vmm_manager_guest_create(struct vmm_devtree_node *gnode)
 		}
 		vcpu->node = vnode;
 		vcpu->is_normal = TRUE;
+		vcpu->is_poweroff = FALSE;
 		vcpu->guest = guest;
 
 		/* Setup start program counter and stack */
@@ -891,7 +896,7 @@ struct vmm_guest *vmm_manager_guest_create(struct vmm_devtree_node *gnode)
 		INIT_RW_LOCK(&vcpu->sched_lock);
 		vcpu->hcpu = vmm_smp_processor_id();
 		vcpu->cpu_affinity = vmm_cpumask_of(vcpu->hcpu);
-		vcpu->state = VMM_VCPU_STATE_UNKNOWN;
+		arch_atomic_write(&vcpu->state, VMM_VCPU_STATE_UNKNOWN);
 		vcpu->state_tstamp = vmm_timer_timestamp();
 		vcpu->state_ready_nsecs = 0;
 		vcpu->state_running_nsecs = 0;
@@ -948,29 +953,29 @@ struct vmm_guest *vmm_manager_guest_create(struct vmm_devtree_node *gnode)
 			continue;
 		}
 
-		/* Setup CPU affinity mask */
+		/* Setup VCPU affinity mask */
 		attrval = vmm_devtree_attrval(vnode,
-				      VMM_DEVTREE_CPU_AFFINITY_ATTR_NAME);
+				      VMM_DEVTREE_VCPU_AFFINITY_ATTR_NAME);
 		if (attrval) {
 			u32 *cpu;
 			u32 i, num_cpu;
 
 			/* Get the number of assigned CPU */
 			num_cpu = vmm_devtree_attrlen(vnode,
-					VMM_DEVTREE_CPU_AFFINITY_ATTR_NAME);
+					VMM_DEVTREE_VCPU_AFFINITY_ATTR_NAME);
 			num_cpu /= sizeof(u32);
 
 			cpu = (u32 *)attrval;
 			affinity_mask[vcpu->id] = VMM_CPU_MASK_NONE;
 
 			/* set all assigned CPU in the mask */
-			for (i=0; i < num_cpu; i++) {
+			for (i = 0; i < num_cpu; i++) {
 				if (cpu[i] <= vmm_cpu_count) {
 					vmm_cpumask_set_cpu(cpu[i],
 						&affinity_mask[vcpu->id]);
 				} else {
 					vmm_printf(
-						"%s: CPU %d is out of bound"
+						"%s: CPU%d is out of bound"
 						" (%d) for vcpu %s\n",
 						__func__, cpu[i],
 						vmm_cpu_count, vcpu->name);
@@ -994,6 +999,13 @@ struct vmm_guest *vmm_manager_guest_create(struct vmm_devtree_node *gnode)
 			vmm_manager_vcpu_set_affinity(vcpu, cpu_online_mask);
 		}
 
+		/* Get poweroff flag from device tree */
+		attrval = vmm_devtree_attrval(vnode,
+					      VMM_DEVTREE_VCPU_POWEROFF_ATTR_NAME);
+		if (attrval) {
+			vcpu->is_poweroff = TRUE;
+		}
+
 		/* Increment VCPU count */
 		mngr.vcpu_count++;
 
@@ -1006,6 +1018,15 @@ struct vmm_guest *vmm_manager_guest_create(struct vmm_devtree_node *gnode)
 
 	/* Initialize guest address space */
 	if (vmm_guest_aspace_init(guest)) {
+		goto guest_create_error;
+	}
+
+	/* Fail if no VCPU is associated to the guest */
+	if (list_empty(&guest->vcpu_list)) {
+		goto guest_create_error;
+	}
+
+	if (list_empty(&guest->vcpu_list)) {
 		goto guest_create_error;
 	}
 
@@ -1164,7 +1185,7 @@ int __init vmm_manager_init(void)
 		mngr.vcpu_array[vnum].name[0] = 0;
 		mngr.vcpu_array[vnum].node = NULL;
 		mngr.vcpu_array[vnum].is_normal = FALSE;
-		mngr.vcpu_array[vnum].state = VMM_VCPU_STATE_UNKNOWN;
+		arch_atomic_write(&mngr.vcpu_array[vnum].state, VMM_VCPU_STATE_UNKNOWN);
 		mngr.vcpu_array[vnum].state_tstamp = 0;
 		mngr.vcpu_array[vnum].state_ready_nsecs = 0;
 		mngr.vcpu_array[vnum].state_running_nsecs = 0;
