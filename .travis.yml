@@ -1,0 +1,13 @@
+language: c
+before_install:
+    - sudo apt-get -y install dtc
+
+dist: bionic
+branches:
+    only:
+        - x86-next
+script:
+    - make ARCH=x86 x86_64_generic-defconfig
+    - make
+os:
+    - linux
