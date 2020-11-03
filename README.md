@@ -1,3 +1,5 @@
+[![x86 Build Status](https://travis-ci.com/hschauhan/xvisor-x86_64.svg?branch=x86-next)](https://travis-ci.com/hschauhan/xvisor-x86_64)
+
 # Xvisor
 
 http://xvisor.org
