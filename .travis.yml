@@ -1,6 +1,6 @@
 language: c
 before_install:
-    - sudo apt-get -y install dtc
+    - sudo apt-get -y install device-tree-compiler
 
 dist: bionic
 branches:
