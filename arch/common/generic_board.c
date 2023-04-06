@@ -182,6 +182,9 @@ int __init arch_board_final_init(void)
 			continue;
 		}
 
+		if (!vmm_devtree_is_available(node)) {
+			continue;
+		}
 		/* Do platform device probing using device driver framework */
 		rc = vmm_platform_probe(node);
 		if (rc) {
